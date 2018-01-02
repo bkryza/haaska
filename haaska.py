@@ -27,8 +27,11 @@ import logging
 import operator
 import requests
 import colorsys
+import pprint
+import datetime
 from hashlib import sha1
 from uuid import uuid4
+from jsonschema import validate
 
 logger = logging.getLogger()
 
@@ -37,6 +40,41 @@ LIGHT_SUPPORT_COLOR_TEMP = 2
 LIGHT_SUPPORT_RGB_COLOR = 16
 LIGHT_SUPPORT_XY_COLOR = 64
 
+
+DISPLAY_CATEGORIES = {
+    'garage_door': 'SWITCH',
+    'group': 'SWITCH',
+    'input_boolean': 'SWITCH',
+    'input_slider': 'SWITCH',
+    'switch': 'SWITCH',
+    'fan': 'SWITCH',
+    'cover': 'SWITCH',
+    'lock': 'SMARTLOCK',
+    'script': 'ACTIVITY_TRIGGER',
+    'scene': 'SCENE_TRIGGER',
+    'light': 'LIGHT',
+    'media_player': 'TV',
+    'climate': 'THERMOSTAT',
+    'alert': 'OTHER',
+    'automation': 'ACTIVITY_TRIGGER'
+}
+
+ALEXA_INTERFACES = {
+    'BrightnessController': {'directives': ['AdjustBrightness', 'SetBrightness']},
+    'CameraStreamController': {'directives': ['InitializeCameraStreams']},
+    'ColorController': {'directives': ['SetColor']},
+    'ColorTemperatureController': {'directives': ['DecreaseColorTemperature', 'IncreaseColorTemperature', 'SetColorTemperature']},
+    'InputController': {'directives': ['SelectInput']},
+    'LockController': {'directives': ['Lock', 'Unlock']},
+    'PercentageController': {'directives': ['SetPercentage', 'AdjustPercentage']},
+    'PlaybackController': {'directives': ['FastForward', 'Next', 'Pause', 'Play', 'Previous', 'Rewind', 'StartOver', 'Stop']},
+    'PowerController': {'directives': ['TurnOn', 'TurnOff']},
+    'PowerLevelController': {'directives': ['SetPowerLevel', 'AdjustPowerLevel']},
+    'Speaker': {'directives': ['SetVolume', 'AdjustVolume', 'SetMute']},
+    'StepSpeaker': {'directives': ['AdjustVolume', 'SetMute']},
+    'TemperatureSensor': {'directives': ['ReportState']},
+    'ThermostatController': {'directives': ['SetTargetTemperature', 'AdjustTargetTemperature', 'SetThermostatMode']}
+}
 
 class HomeAssistant(object):
     def __init__(self, config):
@@ -75,70 +113,85 @@ class HomeAssistant(object):
         return r
 
 
-class ConnectedHomeCall(object):
-    def __init__(self, namespace, name, ha, payload):
+class Directive(object):
+    def __init__(self, namespace, name, ha, payload, endpoint):
         self.namespace = namespace
         self.name = name
-        self.response_name = self.name.replace('Request', 'Response')
+        self.response_name = self.name + '.Response'
         self.ha = ha
         self.payload = payload
+        self.endpoint = endpoint
         self.entity = None
-        if 'appliance' in self.payload:
-            details = payload['appliance']['additionalApplianceDetails']
-            self.entity = mk_entity(ha, details['entity_id'])
+        if self.endpoint and ('endpointId' in self.endpoint):
+            self.entity = mk_entity(ha, self.endpoint['endpointId'].replace(':', '.'))
 
-    class ConnectedHomeException(Exception):
+    class DirectiveException(Exception):
         def __init__(self, name="DriverInternalError", payload={}):
             self.error_name = name
             self.payload = payload
 
-    class ValueOutOfRangeError(ConnectedHomeException):
+    class ValueOutOfRangeError(DirectiveException):
         def __init__(self, minValue, maxValue):
             self.error_name = 'ValueOutOfRangeError'
             self.payload = {'minimumValue': minValue, 'maximumValue': maxValue}
 
     def invoke(self, name):
         logger.debug('invoking %s %s', self.namespace, name)
-        r = {}
+        r = {'event': {}}
         try:
+            # Setup event
             payload = operator.attrgetter(name)(self)()
             if payload:
-                r['payload'] = payload
+                r['event']['payload'] = payload
             else:
-                r['payload'] = {'success': True}
-            logger.debug('response payload: %s', str(r['payload']))
-        except ConnectedHomeCall.ConnectedHomeException as e:
+                r['event']['payload'] = {}
+
+            if self.endpoint:
+                r['event']['endpoint'] = self.endpoint
+            # Setup context
+            r['context'] = {'properties': []}
+            r['context']['properties'].append(
+                 {
+                    "namespace": "Alexa.EndpointHealth",
+                    "name": "connectivity",
+                    "value": {
+                        "value": "OK"
+                    },
+                    "timeOfSample": datetime.datetime.utcnow().isoformat(),
+                    "uncertaintyInMilliseconds": 200
+                })
+            logger.debug('response payload: %s', str(r['event']['payload']))
+        except Directive.DirectiveException as e:
             logger.exception('handler failed: %s, %s', e.error_name, e.payload)
             self.response_name = e.error_name
-            r['payload'] = e.payload
+            r['event']['payload'] = e.payload
         except Exception:
             logger.exception('handler failed unexpectedly')
             self.response_name = 'DriverInternalError'
-            r['payload'] = {}
+            r['event']['payload'] = {}
 
-        r['header'] = {'namespace': self.namespace,
+        r['event']['header'] = {'namespace': self.namespace,
                        'messageId': str(uuid4()),
                        'name': self.response_name,
-                       'payloadVersion': '2'}
+                       'payloadVersion': '3',
+                       'correlationToken': '123'}
         return r
 
 
 class Alexa(object):
-    class ConnectedHome(object):
-        class System(ConnectedHomeCall):
-            def HealthCheckRequest(self):
-                try:
-                    self.ha.get('states')
-                    return {'isHealthy': True}
-                except Exception as e:
-                    logger.exception('HealthCheckRequest failed')
-                    return {'isHealthy': False, 'description': str(e)}
+        # class System(ConnectedHomeCall):
+        #     def HealthCheckRequest(self):
+        #         try:
+        #             result = self.ha.get('')
+        #             return {'isHealthy': "API running" in result['message'] }
+        #         except Exception as e:
+        #             logger.exception('HealthCheckRequest failed')
+        #             return {'isHealthy': False, 'description': str(e)}
 
-        class Discovery(ConnectedHomeCall):
-            def DiscoverAppliancesRequest(self):
+        class Discovery(Directive):
+            def Discover(self):
                 try:
-                    return {'discoveredAppliances':
-                            discover_appliances(self.ha)}
+                    return {'endpoints': discover_appliances(self.ha)}                            
                 except Exception:
                     logger.exception('DiscoverAppliancesRequest failed')
                     # v2 documentation is unclear as to what should be returned
@@ -146,152 +199,163 @@ class Alexa(object):
                     # 0 devices and log the error
                     return {'discoveredAppliances': {}}
 
-        class Control(ConnectedHomeCall):
-            def __init__(self, namespace, name, ha, payload):
-                super(Alexa.ConnectedHome.Control, self).__init__(
-                        namespace, name, ha, payload)
-                self.response_name = name.replace('Request', 'Confirmation')
-
-            def TurnOnRequest(self):
+        class PowerController(Directive):
+            def TurnOn(self):
+                print("Turning on")
                 self.entity.turn_on()
+                pass
 
-            def TurnOffRequest(self):
+            def TurnOff(self):
+                print("Turning off")
                 self.entity.turn_off()
+                pass
 
-            def SetPercentageRequest(self):
-                percentage = self.payload['percentageState']['value']
-                self.entity.set_percentage(percentage)
+        # class Control(ConnectedHomeCall):
+        #     def __init__(self, namespace, name, ha, payload):
+        #         super(Alexa.ConnectedHome.Control, self).__init__(
+        #                 namespace, name, ha, payload)
+        #         self.response_name = name.replace('Request', 'Confirmation')
 
-            def handle_percentage_adj(self, deltaValue):
-                current = self.entity.get_percentage()
-                new = current + deltaValue
+        #     def TurnOnRequest(self):
+        #         self.entity.turn_on()
 
-                # So this looks weird, but the relative adjustments seem to
-                # always be +/- 25%, which means depending on the current
-                # brightness we could over-/undershoot the acceptable range.
-                # Instead, if we're not currently saturated, clamp the desired
-                # brightness to the allowed brightness.
-                if current != 100 and current != 0:
-                    if new < 0:
-                        new = 0
-                    elif new > 100:
-                        new = 100
+        #     def TurnOffRequest(self):
+        #         self.entity.turn_off()
 
-                if new > 100 or new < 0:
-                    raise ConnectedHomeCall.ValueOutOfRangeError(0, 100)
+        #     def SetPercentageRequest(self):
+        #         percentage = self.payload['percentageState']['value']
+        #         self.entity.set_percentage(percentage)
 
-                self.entity.set_percentage(new)
+        #     def handle_percentage_adj(self, deltaValue):
+        #         current = self.entity.get_percentage()
+        #         new = current + deltaValue
 
-            def IncrementPercentageRequest(self):
-                deltaValue = self.payload['deltaPercentage']['value']
-                return self.handle_percentage_adj(deltaValue)
+        #         # So this looks weird, but the relative adjustments seem to
+        #         # always be +/- 25%, which means depending on the current
+        #         # brightness we could over-/undershoot the acceptable range.
+        #         # Instead, if we're not currently saturated, clamp the desired
+        #         # brightness to the allowed brightness.
+        #         if current != 100 and current != 0:
+        #             if new < 0:
+        #                 new = 0
+        #             elif new > 100:
+        #                 new = 100
 
-            def DecrementPercentageRequest(self):
-                deltaValue = -self.payload['deltaPercentage']['value']
-                return self.handle_percentage_adj(deltaValue)
+        #         if new > 100 or new < 0:
+        #             raise ConnectedHomeCall.ValueOutOfRangeError(0, 100)
 
-            def handle_color_temperature_adj(self, op):
-                current = self.entity.get_color_temperature()
-                new = op(current, 500)
-                self.entity.set_color_temperature(new)
-                return {'achievedState': {'colorTemperature': {'value': new}}}
+        #         self.entity.set_percentage(new)
 
-            def IncrementColorTemperatureRequest(self):
-                return self.handle_color_temperature_adj(operator.add)
+        #     def IncrementPercentageRequest(self):
+        #         deltaValue = self.payload['deltaPercentage']['value']
+        #         return self.handle_percentage_adj(deltaValue)
 
-            def DecrementColorTemperatureRequest(self):
-                return self.handle_color_temperature_adj(operator.sub)
+        #     def DecrementPercentageRequest(self):
+        #         deltaValue = -self.payload['deltaPercentage']['value']
+        #         return self.handle_percentage_adj(deltaValue)
 
-            def SetColorTemperatureRequest(self):
-                temp = self.payload['colorTemperature']['value']
-                self.entity.set_color_temperature(temp)
-                return {'achievedState': {'colorTemperature': {'value': temp}}}
+        #     def handle_color_temperature_adj(self, op):
+        #         current = self.entity.get_color_temperature()
+        #         new = op(current, 500)
+        #         self.entity.set_color_temperature(new)
+        #         return {'achievedState': {'colorTemperature': {'value': new}}}
 
-            def handle_temperature_adj(self, op=None):
-                state = self.ha.get('states/' + self.entity.entity_id)
-                unit = state['attributes']['unit_of_measurement']
-                min_temp = convert_temp(state['attributes']['min_temp'], unit)
-                max_temp = convert_temp(state['attributes']['max_temp'], unit)
+        #     def IncrementColorTemperatureRequest(self):
+        #         return self.handle_color_temperature_adj(operator.add)
 
-                temperature, mode = self.entity.get_temperature(state)
+        #     def DecrementColorTemperatureRequest(self):
+        #         return self.handle_color_temperature_adj(operator.sub)
 
-                if op is not None and 'deltaTemperature' in self.payload:
-                    new = op(temperature,
-                             float(self.payload['deltaTemperature']['value']))
-                    # Clamp the allowed temperature for relative adjustments
-                    if temperature != max_temp and temperature != min_temp:
-                        if new < min_temp:
-                            new = min_temp
-                        elif new > max_temp:
-                            new = max_temp
-                else:
-                    new = float(self.payload['targetTemperature']['value'])
+        #     def SetColorTemperatureRequest(self):
+        #         temp = self.payload['colorTemperature']['value']
+        #         self.entity.set_color_temperature(temp)
+        #         return {'achievedState': {'colorTemperature': {'value': temp}}}
 
-                if new > max_temp or new < min_temp:
-                    raise ConnectedHomeCall.ValueOutOfRangeError(min_temp,
-                                                                 max_temp)
+        #     def handle_temperature_adj(self, op=None):
+        #         state = self.ha.get('states/' + self.entity.entity_id)
+        #         unit = state['attributes']['unit_of_measurement']
+        #         min_temp = convert_temp(state['attributes']['min_temp'], unit)
+        #         max_temp = convert_temp(state['attributes']['max_temp'], unit)
 
-                # Only 3 allowed values for mode in this response
-                if mode not in ['AUTO', 'COOL', 'HEAT']:
-                    current = self.entity.get_current_temperature(state)
-                    mode = 'COOL' if current >= new else 'HEAT'
+        #         temperature, mode = self.entity.get_temperature(state)
 
-                self.entity.set_temperature(new, mode.lower(), state)
+        #         if op is not None and 'deltaTemperature' in self.payload:
+        #             new = op(temperature,
+        #                      float(self.payload['deltaTemperature']['value']))
+        #             # Clamp the allowed temperature for relative adjustments
+        #             if temperature != max_temp and temperature != min_temp:
+        #                 if new < min_temp:
+        #                     new = min_temp
+        #                 elif new > max_temp:
+        #                     new = max_temp
+        #         else:
+        #             new = float(self.payload['targetTemperature']['value'])
 
-                return {'targetTemperature': {'value': new},
-                        'temperatureMode': {'value': mode},
-                        'previousState': {
-                            'targetTemperature': {'value': temperature},
-                            'mode': {'value': mode}}}
+        #         if new > max_temp or new < min_temp:
+        #             raise ConnectedHomeCall.ValueOutOfRangeError(min_temp,
+        #                                                          max_temp)
 
-            def SetTargetTemperatureRequest(self):
-                return self.handle_temperature_adj()
+        #         # Only 3 allowed values for mode in this response
+        #         if mode not in ['AUTO', 'COOL', 'HEAT']:
+        #             current = self.entity.get_current_temperature(state)
+        #             mode = 'COOL' if current >= new else 'HEAT'
 
-            def IncrementTargetTemperatureRequest(self):
-                return self.handle_temperature_adj(operator.add)
+        #         self.entity.set_temperature(new, mode.lower(), state)
 
-            def DecrementTargetTemperatureRequest(self):
-                return self.handle_temperature_adj(operator.sub)
+        #         return {'targetTemperature': {'value': new},
+        #                 'temperatureMode': {'value': mode},
+        #                 'previousState': {
+        #                     'targetTemperature': {'value': temperature},
+        #                     'mode': {'value': mode}}}
 
-            def SetLockStateRequest(self):
-                self.entity.set_lock_state(self.payload["lockState"])
-                return {'lockState': self.payload["lockState"]}
+        #     def SetTargetTemperatureRequest(self):
+        #         return self.handle_temperature_adj()
 
-            def SetColorRequest(self):
-                self.entity.set_color(self.payload['color']['hue'],
-                                      self.payload['color']['saturation'],
-                                      self.payload['color']['brightness'])
-                return {'achievedState': {'color': self.payload['color']}}
+        #     def IncrementTargetTemperatureRequest(self):
+        #         return self.handle_temperature_adj(operator.add)
 
-        class Query(ConnectedHomeCall):
-            def __init__(self, namespace, name, ha, payload):
-                super(Alexa.ConnectedHome.Query, self).__init__(
-                        namespace, name, ha, payload)
+        #     def DecrementTargetTemperatureRequest(self):
+        #         return self.handle_temperature_adj(operator.sub)
 
-            def GetTemperatureReadingRequest(self):
-                temperature = self.entity.get_current_temperature()
-                return {'temperatureReading': {'value': temperature}}
+        #     def SetLockStateRequest(self):
+        #         self.entity.set_lock_state(self.payload["lockState"])
+        #         return {'lockState': self.payload["lockState"]}
 
-            def GetTargetTemperatureRequest(self):
-                temperature, mode = self.entity.get_temperature()
-                payload = {'targetTemperature': {'value': temperature},
-                           'temperatureMode': {'value': mode}}
-                if mode not in ['AUTO', 'COOL', 'HEAT', 'OFF']:
-                    payload['temperatureMode'] = {
-                        'value': 'CUSTOM',
-                        'friendlyName': mode.replace('_', ' ').title()}
-                return payload
+        #     def SetColorRequest(self):
+        #         self.entity.set_color(self.payload['color']['hue'],
+        #                               self.payload['color']['saturation'],
+        #                               self.payload['color']['brightness'])
+        #         return {'achievedState': {'color': self.payload['color']}}
 
-            def GetLockStateRequest(self):
-                lock_state = self.entity.get_lock_state().upper()
-                return {'lockState': lock_state}
+        # class Query(ConnectedHomeCall):
+        #     def __init__(self, namespace, name, ha, payload):
+        #         super(Alexa.ConnectedHome.Query, self).__init__(
+        #                 namespace, name, ha, payload)
+
+        #     def GetTemperatureReadingRequest(self):
+        #         temperature = self.entity.get_current_temperature()
+        #         return {'temperatureReading': {'value': temperature}}
+
+        #     def GetTargetTemperatureRequest(self):
+        #         temperature, mode = self.entity.get_temperature()
+        #         payload = {'targetTemperature': {'value': temperature},
+        #                    'temperatureMode': {'value': mode}}
+        #         if mode not in ['AUTO', 'COOL', 'HEAT', 'OFF']:
+        #             payload['temperatureMode'] = {
+        #                 'value': 'CUSTOM',
+        #                 'friendlyName': mode.replace('_', ' ').title()}
+        #         return payload
+
+        #     def GetLockStateRequest(self):
+        #         lock_state = self.entity.get_lock_state().upper()
+        #         return {'lockState': lock_state}
 
 
-def invoke(namespace, name, ha, context):
+def invoke(namespace, name, ha, payload, endpoint):
     class allowed(object):
         Alexa = Alexa
     make_class = operator.attrgetter(namespace)
-    obj = make_class(allowed)(namespace, name, ha, context)
+    obj = make_class(allowed)(namespace, name, ha, payload, endpoint)
     return obj.invoke(name)
 
 
@@ -317,11 +381,11 @@ def discover_appliances(ha):
             features = x['attributes']['supported_features']
         entity = mk_entity(ha, x['entity_id'], features)
         o = {}
-        # this needs to be unique and has limitations on allowed characters:
-        o['applianceId'] = sha1(x['entity_id'].encode('utf-8')).hexdigest()
+        # this needs to be unique and has limitations on allowed characters ("^[a-zA-Z0-9_\\-=#;:?@&]*$"):
+        o['endpointId'] = x['entity_id'].replace('.', ':')
         o['manufacturerName'] = 'Unknown'
         o['modelName'] = 'Unknown'
-        o['version'] = 'Unknown'
+        o['displayCategories'] = ['SWITCH']
         if 'haaska_name' in x['attributes']:
             o['friendlyName'] = x['attributes']['haaska_name']
         else:
@@ -330,14 +394,11 @@ def discover_appliances(ha):
             if suffix != '':
                 o['friendlyName'] += ' ' + suffix
         if 'haaska_desc' in x['attributes']:
-            o['friendlyDescription'] = x['attributes']['haaska_desc']
+            o['description'] = x['attributes']['haaska_desc']
         else:
-            o['friendlyDescription'] = 'Home Assistant ' + \
+            o['description'] = 'Home Assistant ' + \
                 entity_domain(x).replace('_', ' ').title()
-        o['isReachable'] = True
-        o['actions'] = entity.get_actions()
-        o['additionalApplianceDetails'] = {'entity_id': x['entity_id'],
-                                           'supported_features': features}
+        o['capabilities'] = entity.get_capabilities()
         return o
 
     states = ha.get('states')
@@ -362,10 +423,11 @@ def convert_temp(temp, from_unit=u'°C', to_unit=u'°C'):
         return (temp - 32) / 1.8
 
 
+
 class Entity(object):
     def __init__(self, ha, entity_id, supported_features):
         self.ha = ha
-        self.entity_id = entity_id
+        self.entity_id = entity_id.replace(':', '.')
         self.supported_features = supported_features
         self.entity_domain = self.entity_id.split('.', 1)[0]
 
@@ -373,46 +435,151 @@ class Entity(object):
         data['entity_id'] = self.entity_id
         self.ha.post('services/' + service, data)
 
-    def get_actions(self):
-        actions = []
+    def get_model_name(self):
+        return None
 
-        if hasattr(self, 'turn_on'):
-            actions.append('turnOn')
-        if hasattr(self, 'turn_off'):
-            actions.append('turnOff')
+    def get_capabilities(self):
+        capabilities = []
 
-        if hasattr(self, 'set_percentage'):
-            actions.append('setPercentage')
-        if hasattr(self, 'get_percentage'):
-            actions.append('incrementPercentage')
-            actions.append('decrementPercentage')
+        capabilities.append(
+            {
+                "type": "AlexaInterface",
+                "interface": "Alexa",
+                "version": "3"
+            })
 
-        if hasattr(self, 'get_current_temperature'):
-            actions.append('getTemperatureReading')
+        if hasattr(self, 'turn_on') or hasattr(self, 'turn_off'):
+            capabilities.append(
+                {
+                    "type": "AlexaInterface",
+                    "interface": "Alexa.PowerController",
+                    "version": "3",
+                    "properties": {
+                        "supported": [
+                            {
+                                "name": "powerState"
+                            }
+                        ],
+                        "proactivelyReported": True,
+                        "retrievable": True
+                    }
+                })
+
+        if hasattr(self, 'set_percentage') or hasattr(self, 'get_percentage'):
+            capabilities.append(
+                {
+                    "type": "AlexaInterface",
+                    "interface": "Alexa.PercentageController",
+                    "version": "3",
+                    "properties": {
+                        "supported": [
+                            {
+                                "name": "percentage"
+                            }
+                        ],
+                        "proactivelyReported": True,
+                        "retrievable": True
+                    }
+                })
+
+
+        if hasattr(self, 'get_current_temperature') or hasattr(self, 'get_temperature'):
+            capabilities.append(
+                {
+                    "type": "AlexaInterface",
+                    "interface": "Alexa.TemperatureSensor",
+                    "version": "3",
+                    "properties": {
+                        "supported": [
+                            {
+                                "name": "temperature"
+                            }
+                        ],
+                        "proactivelyReported": True,
+                        "retrievable": True
+                    }
+                })
+
+
         if hasattr(self, 'set_temperature'):
-            actions.append('setTargetTemperature')
-        if hasattr(self, 'get_temperature'):
-            actions.append('getTargetTemperature')
-            actions.append('incrementTargetTemperature')
-            actions.append('decrementTargetTemperature')
+            capabilities.append(
+                {
+                    "type": "AlexaInterface",
+                    "interface": "Alexa.ThermostatController",
+                    "version": "3",
+                    "properties": {
+                        "supported": [
+                            {
+                                "name": "upperSetpoint"
+                            },
+                            {
+                                "name": "lowerSetpoint"
+                            },
+                            {
+                                "name": "thermostatMode"
+                            }
+                        ],
+                        "proactivelyReported": True,
+                        "retrievable": True
+                    }
+                })
 
-        if hasattr(self, 'get_lock_state'):
-            actions.append('getLockState')
-        if hasattr(self, 'set_lock_state'):
-            actions.append('setLockState')
+        if hasattr(self, 'get_lock_state') or hasattr(self, 'set_lock_state'):
+            capabilities.append(
+                {
+                    "type": "AlexaInterface",
+                    "interface": "Alexa.LockController",
+                    "version": "3",
+                    "properties": {
+                        "supported": [
+                            {
+                                "name": "lockState"
+                            }
+                        ],
+                        "proactivelyReported": True,
+                        "retrievable": True
+                    }
+                })
 
         if self.entity_domain == "light":
             if self.supported_features & LIGHT_SUPPORT_RGB_COLOR:
-                actions.append('setColor')
+                capabilities.append(
+                    {
+                        "type": "AlexaInterface",
+                        "interface": "Alexa.ColorController",
+                        "version": "3",
+                        "properties": {
+                            "supported": [
+                                {
+                                    "name": "color"
+                                }
+                            ],
+                            "proactivelyReported": True,
+                            "retrievable": True
+                        }
+                    })
             if self.supported_features & LIGHT_SUPPORT_COLOR_TEMP:
-                actions.append('setColorTemperature')
-                actions.append('incrementColorTemperature')
-                actions.append('decrementColorTemperature')
+                capabilities.append(
+                    {
+                        "type": "AlexaInterface",
+                        "interface": "Alexa.ColorTemperatureController",
+                        "version": "3",
+                        "properties": {
+                            "supported": [
+                                {
+                                    "name": "colorTemperatureInKelvin"
+                                }
+                            ],
+                            "proactivelyReported": True,
+                            "retrievable": True
+                        }
+                    })
 
-        return actions
+        return capabilities
 
 
 class ToggleEntity(Entity):
+
     def turn_on(self):
         self._call_service('homeassistant/turn_on')
 
@@ -651,18 +818,89 @@ class Configuration(object):
         return json.dumps(self.opts, indent=2, separators=(',', ': '))
 
 
-def event_handler(event, context):
+def directive_handler(directive, context):
     config = Configuration('config.json')
     if config.debug:
         logger.setLevel(logging.DEBUG)
     ha = HomeAssistant(config)
 
-    name = event['header']['name']
-    payload = event['payload']
+    directive = directive['directive']
+    name = directive['header']['name']
+    namespace = directive['header']['namespace']
+    payload = directive.get('payload')
+    endpoint = directive.get('endpoint')
 
     logger.debug('calling event handler for %s, payload: %s', name,
                  str({k: v for k, v in payload.items()
                      if k != u'accessToken'}))
 
-    return invoke(event['header']['namespace'], event['header']['name'],
-                  ha, payload)
+    return invoke(namespace, name, ha, payload, endpoint)
+
+
+if __name__ == "__main__":
+    discovery_request = {
+        "directive": {
+            "header": {
+                "namespace": "Alexa.Discovery",
+                "name": "Discover",
+                "payloadVersion": "3",
+                "messageId": "1bd5d003-31b9-476f-ad03-71d471922820"
+            },
+            "payload": {
+                "scope": {
+                    "type": "BearerToken",
+                    "token": "access-token-from-skill"
+                }
+            }
+        }
+    }
+
+    rotel_request_on = {
+        "directive": {
+            "header": {
+                "namespace": "Alexa.PowerController",
+                "name": "TurnOn",
+                "payloadVersion": "3",
+                "messageId": "321",
+                "correlationToken": "123"
+            },
+            "endpoint": {
+                "scope": {
+                    "type": "BearerToken",
+                    "token": "access-token-from-skill"
+                },
+                "endpointId": "switch:rotel",
+                "cookie": {}
+            },
+            "payload": {}
+        }
+    }
+    rotel_request_off = {
+        "directive": {
+            "header": {
+                "namespace": "Alexa.PowerController",
+                "name": "TurnOff",
+                "payloadVersion": "3",
+                "messageId": "321",
+                "correlationToken": "123"
+            },
+            "endpoint": {
+                "scope": {
+                    "type": "BearerToken",
+                    "token": "access-token-from-skill"
+                },
+                "endpointId": "switch:rotel",
+                "cookie": {}
+            },
+            "payload": {}
+        }
+    }
+
+    res = directive_handler(rotel_request_off, None)
+
+    # with open('alexa_smart_home_message_schema.json') as f:
+    #     alexa_response_schema = json.load(f)
+    #     v = validate(json.dumps(res), alexa_response_schema)
+    #     print(v)
+    
+    pprint.pprint(res)

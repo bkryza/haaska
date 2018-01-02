@@ -9,7 +9,7 @@ BUILD_DIR=build
 haaska.zip: haaska.py config/*
 	mkdir -p $(BUILD_DIR)
 	cp $^ $(BUILD_DIR)
-	pip install -t $(BUILD_DIR) requests
+	pip install --system -t $(BUILD_DIR) requests
 	cd $(BUILD_DIR); zip ../$@ -r *
 
 .PHONY: deploy
@@ -21,18 +21,28 @@ deploy: haaska.zip
 		--function-name $(FUNCTION_NAME) \
 		--zip-file fileb://$<
 
-TEST_PAYLOAD:='                                \
-{                                              \
-  "header": {                                  \
-    "payloadVersion": "2",                     \
-    "namespace": "Alexa.ConnectedHome.System", \
-    "name": "HealthCheckRequest"               \
-  },                                           \
-  "payload": {                                 \
-    "accessToken": "..."                       \
-  }                                            \
+TEST_PAYLOAD:=' \
+{ \
+  "directive": { \
+    "header": { \
+      "messageId": "abc-123-def-456", \
+      "correlationToken": "abcdef-123456", \
+      "namespace": "Alexa", \
+      "name": "ReportState", \
+      "payloadVersion": "3" \
+    }, \
+    "endpoint": { \
+      "endpointId": "haaska-api-status", \
+      "cookie": {}, \
+      "scope":{  \
+            "type":"BearerToken", \
+            "token":"access-token-from-skill" \
+      } \
+    }, \
+    "payload": { \
+    } \
+  } \
 }'
-
 .PHONY: test
 test:
 	@aws lambda invoke \
@@ -40,17 +50,24 @@ test:
 		--payload ${TEST_PAYLOAD} \
 		/dev/fd/3 3>&1 >/dev/null | jq -e '., .payload.isHealthy'
 
-DISCOVERY_PAYLOAD:='                              \
-{                                                 \
-  "header": {                                     \
-    "payloadVersion": "2",                        \
-    "namespace": "Alexa.ConnectedHome.Discovery", \
-    "name": "DiscoverAppliancesRequest"           \
-  },                                              \
-  "payload": {                                    \
-    "accessToken": "..."                          \
-  }                                               \
+DISCOVERY_PAYLOAD:=' \
+{ \
+    "directive": { \
+        "header": { \
+            "namespace": "Alexa.Discovery", \
+            "name": "Discover", \
+            "payloadVersion": "3", \
+            "messageId": "1bd5d003-31b9-476f-ad03-71d471922820" \
+        }, \
+        "payload": { \
+            "scope": { \
+                "type": "BearerToken", \
+                "token": "access-token-from-skill" \
+            } \
+        } \
+    } \
 }'
+
 
 .PHONY: discover
 discover:
