@@ -122,6 +122,7 @@ class Directive(object):
         self.payload = payload
         self.endpoint = endpoint
         self.entity = None
+        self.context_properties = []
         if self.endpoint and ('endpointId' in self.endpoint):
             self.entity = mk_entity(ha, self.endpoint['endpointId'].replace(':', '.'))
 
@@ -149,9 +150,7 @@ class Directive(object):
             if self.endpoint:
                 r['event']['endpoint'] = self.endpoint
             # Setup context
-            r['context'] = {'properties': []}
-            r['context']['properties'].append(
-                 {
+            self.context_properties.append({
                     "namespace": "Alexa.EndpointHealth",
                     "name": "connectivity",
                     "value": {
@@ -160,6 +159,7 @@ class Directive(object):
                     "timeOfSample": datetime.datetime.utcnow().isoformat(),
                     "uncertaintyInMilliseconds": 200
                 })
+            r['context'] = {'properties': self.context_properties}
             logger.debug('response payload: %s', str(r['event']['payload']))
         except Directive.DirectiveException as e:
             logger.exception('handler failed: %s, %s', e.error_name, e.payload)
@@ -203,11 +203,25 @@ class Alexa(object):
             def TurnOn(self):
                 print("Turning on")
                 self.entity.turn_on()
+                self.context_properties.append({
+                    "namespace": "Alexa.PowerController",
+                    "name": "powerState",
+                    "value": "ON",
+                    "timeOfSample": datetime.datetime.utcnow().isoformat(),
+                    "uncertaintyInMilliseconds": 200
+                })
                 pass
 
             def TurnOff(self):
                 print("Turning off")
                 self.entity.turn_off()
+                self.context_properties.append({
+                    "namespace": "Alexa.PowerController",
+                    "name": "powerState",
+                    "value": "OFF",
+                    "timeOfSample": datetime.datetime.utcnow().isoformat(),
+                    "uncertaintyInMilliseconds": 200
+                })
                 pass
 
         # class Control(ConnectedHomeCall):
